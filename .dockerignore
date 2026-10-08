@@ -1,0 +1,24 @@
+# Keep the build context small and secrets out of images.
+# The Dockerfile copies explicit paths, but everything listed here never even
+# reaches the Docker daemon.
+
+# Secrets — must never be baked into an image
+.env
+.env.*
+!.env.example
+
+# Local virtualenv: built for Windows, useless (and huge) inside a Linux image
+.venv/
+
+# Git history and tool caches
+.git/
+__pycache__/
+*.py[oc]
+.pytest_cache/
+.ruff_cache/
+
+# Not needed at runtime
+*.md
+tests/
+eval/
+docs/

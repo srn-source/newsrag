@@ -1,0 +1,31 @@
+# Override: give the containers your Google credentials, so they can call Vertex AI.
+#
+# Why this is needed: on your machine, Python finds the credentials created by
+# `gcloud auth application-default login`. A container cannot see that file, so
+# this mounts it in, read-only, and tells the Google SDK where it is.
+#
+# Local testing only. On Cloud Run nothing is mounted: the service account attached
+# to the service provides the credentials. The file is never copied into an image.
+#
+# Usage (PowerShell), from the project folder:
+#   $env:GCLOUD_ADC_FILE = "$env:APPDATA\gcloud\application_default_credentials.json"
+#   docker compose -f docker-compose.yml -f docker-compose.vertex.yml up --build -d api
+#   docker compose -f docker-compose.yml -f docker-compose.vertex.yml --profile jobs run --rm ingest
+#
+# On macOS / Linux the file is ~/.config/gcloud/application_default_credentials.json
+
+x-google-credentials: &google-credentials
+  environment:
+    GOOGLE_APPLICATION_CREDENTIALS: /gcp/adc.json
+  volumes:
+    - type: bind
+      # Fails with a clear message if GCLOUD_ADC_FILE is not set.
+      source: ${GCLOUD_ADC_FILE:?Set GCLOUD_ADC_FILE to your application_default_credentials.json}
+      target: /gcp/adc.json
+      read_only: true
+
+services:
+  api:
+    <<: *google-credentials
+  ingest:
+    <<: *google-credentials

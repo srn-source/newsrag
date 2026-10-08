@@ -1,0 +1,91 @@
+# Local development stack.
+#
+#   docker compose up -d db      # just the database (what Alembic and pytest need)
+#   docker compose logs -f db    # watch startup
+#   docker compose down          # stop, keep data
+#   docker compose down -v       # stop and DELETE the data volume
+#   docker compose up --build    # db + api; then open http://localhost:8080/docs
+#
+#   docker compose --profile tools up -d adminer   # database web UI: http://localhost:8081
+#     login -> System: PostgreSQL | Server: db | Username: rag | Password: rag | Database: rag
+#
+#   With real Vertex AI inside the containers, add the override file
+#   docker-compose.vertex.yml (see the comments in that file).
+
+services:
+  db:
+    # Official pgvector image = PostgreSQL 16 with the `vector` extension already
+    # compiled in. The plain `postgres:16` image cannot run CREATE EXTENSION vector.
+    image: pgvector/pgvector:pg16
+    container_name: newsrag-db
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: rag
+    ports:
+      # host:container — so tools on your machine (alembic, pytest, psql) reach it
+      # at localhost:5432, which is what DATABASE_URL in .env points to.
+      - "5432:5432"
+    volumes:
+      # Named volume: data survives `docker compose down`.
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Postgres accepts TCP connections a moment before it is ready for queries.
+      # Without this, `alembic upgrade head` run straight after `up` can fail.
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      target: api # the `api` stage of the Dockerfile (not `ingest`)
+    image: newsrag-api # name for the built image (otherwise compose names it rag_multi_hop-api)
+    container_name: newsrag-api
+    env_file: .env
+    environment:
+      # Overrides DATABASE_URL from .env: inside the compose network the database
+      # host is the service name `db`, not `localhost`.
+      DATABASE_URL: postgresql+asyncpg://rag:rag@db:5432/rag
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy # wait for pg_isready, not just "container started"
+
+  ingest:
+    # The same image the Cloud Run Job runs: `alembic upgrade head`, then ingestion.
+    # A one-off job, not a server: start it with
+    #   docker compose --profile jobs run --rm ingest
+    build:
+      context: .
+      target: ingest
+    image: newsrag-ingest
+    profiles: ["jobs"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://rag:rag@db:5432/rag
+    depends_on:
+      db:
+        condition: service_healthy
+
+  adminer:
+    # Lightweight web UI for browsing tables and running SQL. Development only:
+    # the `tools` profile keeps it out of a plain `docker compose up`, and it is
+    # never deployed to GCP.
+    image: adminer
+    container_name: newsrag-adminer
+    profiles: ["tools"]
+    environment:
+      # Pre-fills the Server field. Adminer runs in its own container, so the
+      # database is reached by its service name `db`, not `localhost`.
+      ADMINER_DEFAULT_SERVER: db
+    ports:
+      - "8081:8080" # 8080 on your machine is taken by the API, so use 8081
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
