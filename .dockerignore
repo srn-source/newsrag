@@ -17,7 +17,10 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Not needed at runtime
+# Chainlit's local uploads folder
+**/.files/
+
+# Not needed at runtime (root-level docs only: frontend/chainlit.md is still included)
 *.md
 tests/
 eval/

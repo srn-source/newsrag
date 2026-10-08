@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+# Chainlit: files uploaded during local chat sessions
+.files/

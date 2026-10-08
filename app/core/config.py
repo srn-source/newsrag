@@ -60,6 +60,13 @@ class Settings(BaseSettings):
     # Leave empty to use the model's default (required for Gemini 2.5 models, which
     # do not accept this setting).
     llm_thinking_level: str | None = "low"
+    # Bound every Gemini call. The library defaults are NO timeout and 6 retries
+    # with back-off, so one slow or rate-limited call could hang a request for
+    # minutes. With 40 s and no retry, multihop (2 calls) finishes or fails in
+    # ~85 s, inside Cloud Run's 120 s request timeout; the client may retry.
+    llm_timeout_seconds: float = Field(default=40, gt=0)
+    # 1 = a single attempt. (In the Google SDK, 0 would mean "its default of 5".)
+    llm_max_retries: int = Field(default=1, ge=1)
 
     # --- RAG behaviour ------------------------------------------------------
     # "baseline" = retrieve once.

@@ -57,6 +57,8 @@ def create_chat_model(settings: Settings) -> BaseChatModel:
             project=settings.gcp_project,
             location=settings.gcp_location,
             temperature=0,  # same question -> (nearly) same answer: needed for evaluation
+            timeout=settings.llm_timeout_seconds,  # library default: wait forever
+            max_retries=settings.llm_max_retries,  # library default: 6 retries
             **options,
         )
 
