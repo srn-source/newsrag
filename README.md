@@ -9,8 +9,8 @@ deployed on Google Cloud Run with Cloud SQL.
 
 | | |
 |---|---|
-| **Chat UI (live)** | `<UI_URL>` — login details are sent separately |
-| **API docs (live)** | `<API_URL>/docs` — `POST /ask` needs the `X-API-Key` header, sent separately |
+| **Chat UI (live)** | https://newsrag-ui-cgblbum2pa-as.a.run.app — login details are sent separately |
+| **API docs (live)** | https://newsrag-api-cgblbum2pa-as.a.run.app/docs — `POST /ask` needs the `X-API-Key` header, sent separately |
 | **Demo video** | `<VIDEO_URL>` |
 | **Architecture** | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | **Evaluation** | [EVALUATION.md](EVALUATION.md) |
@@ -30,13 +30,13 @@ A: Sam Bankman-Fried
 ## Try the live demo
 
 **Chat UI**
-1. Open `<UI_URL>` and sign in with username `demo` and the password sent to you separately.
+1. Open the [chat UI](https://newsrag-ui-cgblbum2pa-as.a.run.app) and sign in with username `demo` and the password sent to you separately.
 2. Click one of the four starter questions, or type your own in English or Thai.
 3. While it runs, a step shows the trace (`plan → retrieve → generate → validate`) and the time taken. An answer takes about 15–20 s. The first question after a quiet period can take a few seconds longer, while Cloud Run starts an instance.
 4. Click a **Source N** link to open the exact excerpt behind the answer.
 5. Use the ⚙️ settings to switch between `multihop` (default) and `baseline`, and compare them.
 
-**API:** open `<API_URL>/docs`, choose `POST /ask` → **Try it out**, and put the API key
+**API:** open the [API docs](https://newsrag-api-cgblbum2pa-as.a.run.app/docs), choose `POST /ask` → **Try it out**, and put the API key
 sent to you in the `x-api-key` field.
 
 ## Highlights
@@ -263,7 +263,7 @@ Other endpoints:
 | `GET /ready` | Readiness check. Returns 503 if the database is unreachable. |
 
 ```bash
-curl -X POST "$API_URL/ask" -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+curl -X POST "https://newsrag-api-cgblbum2pa-as.a.run.app/ask" -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
      -d '{"question": "Who is facing a fraud trial according to TechCrunch and The Verge?"}'
 ```
 
