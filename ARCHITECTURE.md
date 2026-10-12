@@ -1,14 +1,12 @@
 # Architecture
 
-> **Stateless compute, a stateful database, a simple service boundary, and measured
-> AI quality.**
+> **Stateless compute, one stateful database, and a simple service boundary.**
 
-The RAG application is stateless, so Cloud Run can scale it horizontally. PostgreSQL
-holds all state, so it is one managed Cloud SQL instance that every instance
-shares, and connection limits are sized for that. The whole RAG pipeline lives in
-one service: splitting retrieval, embedding and generation into microservices would
-add network hops, auth and deployments with no scaling benefit at this size. A piece
-can be pulled out later if it becomes its own bottleneck.
+The RAG application is stateless, so Cloud Run can scale it horizontally. All state
+lives in one managed Cloud SQL instance shared by every instance, and connection
+limits are sized for that. The whole RAG pipeline is one service: splitting it into
+microservices would add network hops, auth and deployments with no scaling benefit at
+this size.
 
 ## 1. Deployment on Google Cloud
 
@@ -33,51 +31,35 @@ flowchart TB
     vx["Vertex AI (global endpoint)<br/>gemini-3.8-flash · text-multilingual-embedding-002"]
     hf["Hugging Face<br/>MultiHop-RAG corpus"]
 
-    user -->|HTTPS + login| ui
+    user -->|"HTTPS + login (WebSocket)"| ui
     ui -->|"POST /ask + X-API-Key"| api
     client -->|"POST /ask + X-API-Key"| api
-    api -->|unix socket /cloudsql| sql
-    job -->|unix socket /cloudsql| sql
+    api --> sql
+    job --> sql
     api --> vx
     job --> vx
     job --> hf
-    sm -.->|injected as env vars| api
-    sm -.->|injected as env vars| ui
-    sm -.->|injected as env vars| job
+    sm -.->|injected as env vars at startup| api
+    sm -.->|injected as env vars at startup| ui
+    sm -.->|injected as env vars at startup| job
     ar -.->|images| run
     api --> logs
 ```
 
 | Component | Purpose | Key settings |
 |---|---|---|
-| **Cloud Run `newsrag-api`** | The RAG API | 1 vCPU, 1 GiB; 0–3 instances; concurrency 20; request timeout 120 s; service account `newsrag-run` |
-| **Cloud Run `newsrag-ui`** | Chainlit chat UI. Calls the API over HTTPS. | 512 MiB; at most 1 instance with session affinity (Chainlit holds a WebSocket per chat); timeout 3600 s; demo login; service account `newsrag-ui` |
-| **Cloud Run Job `newsrag-ingest`** | One-off batch: migrations, then ingestion | 2 GiB, 1-hour task timeout, 1 retry; same service account as the API |
-| **Cloud SQL** | Documents, chunks, embeddings, full-text index | PostgreSQL 16, Enterprise edition, `db-f1-micro`, zonal, 10 GB SSD |
-| **Secret Manager** | All secrets; nothing in code, images or git | 4 secrets, each readable only by the service accounts that need it |
-| **Artifact Registry** | Container images | 3 images built from 2 Dockerfiles, tagged with the git commit |
-| **Vertex AI** | Embeddings and Gemini | Authenticated by the service account (IAM). **There is no LLM API key to leak.** |
+| **Cloud Run `newsrag-api`** | The RAG API | 1 vCPU, 1 GiB; 0–3 instances; concurrency 20; timeout 120 s |
+| **Cloud Run `newsrag-ui`** | Chainlit chat UI; calls the API over HTTPS | 512 MiB; 1 instance with session affinity (WebSocket per chat); demo login |
+| **Cloud Run Job `newsrag-ingest`** | One-off batch: migrations, then ingestion | 2 GiB, 1-hour timeout, 1 retry |
+| **Cloud SQL** | Documents, chunks, embeddings, full-text index | PostgreSQL 16, `db-f1-micro`, zonal, 10 GB SSD |
+| **Secret Manager** | All secrets; nothing in code, images or git | 4 secrets, each readable only by the accounts that need it |
+| **Artifact Registry** | Container images | 3 images, tagged with the git commit |
+| **Vertex AI** | Embeddings and Gemini | Authorised by the service account (IAM): **no LLM API key exists** |
 
-### Identity and access (least privilege)
-
-| Service account | Used by | Roles |
+| Service account | Used by | Roles (least privilege) |
 |---|---|---|
 | `newsrag-run` | API and ingest job | `aiplatform.user`, `cloudsql.client`; `secretAccessor` on `database-url` and `api-key` only |
-| `newsrag-ui` | Chainlit UI | `secretAccessor` on `api-key`, `demo-password` and `chainlit-auth-secret` only. No database or Vertex AI access. |
-
-### Network
-
-Cloud SQL has no authorised networks: nothing on the internet can connect to it
-directly. Cloud Run reaches it through the **Cloud SQL connector**, a unix socket at
-`/cloudsql/<connection-name>` that is authenticated with IAM and encrypted with TLS. So
-`DATABASE_URL` points at a socket, not an IP address:
-
-```text
-postgresql+asyncpg://rag:<password>@/rag?host=/cloudsql/<project>:asia-southeast1:newsrag-db
-```
-
-Production would go further: private IP only, a VPC connector for Cloud Run's outbound
-traffic, and Cloud Armor in front of the services (see [section 8](#8-demo-vs-production)).
+| `newsrag-ui` | Chainlit UI | `secretAccessor` on `api-key`, `demo-password`, `chainlit-auth-secret` only. No database or Vertex AI access. |
 
 ## 2. Request flow
 
@@ -94,7 +76,7 @@ sequenceDiagram
     API->>API: check key, validate input (422 on bad input)
     API->>G: invoke(question, mode, top_k=8)
     opt mode = multihop
-        G->>VX: plan: split into ≤3 sub-queries (structured output)
+        G->>VX: plan: split into ≤3 sub-queries
     end
     loop each query (question + sub-queries)
         G->>VX: embed query
@@ -109,208 +91,45 @@ sequenceDiagram
     API->>API: log one JSON line (latency, steps, status)
 ```
 
-## 3. The RAG graph
+LLM calls per question are bounded: **1 for baseline, 2 for multihop**, with no loops.
+`validate` is deterministic (no LLM call): an answer that cites nothing, or cites an
+excerpt that does not exist, becomes a refusal.
 
-```mermaid
-flowchart LR
-    S([START]) --> plan
-    plan --> retrieve
-    retrieve -->|chunks found| generate
-    retrieve -->|"no chunks (empty DB)"| refuse
-    generate --> validate
-    validate --> E([END])
-    refuse --> E
-```
+**Retrieval** combines two searches, because news questions mix described events with
+exact names:
+- **Vector search** (pgvector cosine) matches meaning.
+- **Keyword search** (PostgreSQL full text with a GIN index) matches exact names such as "TechCrunch".
+- **Reciprocal Rank Fusion** merges the two lists by rank, so there are no weights to tune.
+- **At most 2 chunks per article** keeps one long article from filling every slot.
+- **`Source | Date | Title` header on every chunk** lets questions that name outlets and dates match.
 
-| Node | LLM call | Role |
-|---|---|---|
-| `plan` | 1 (multihop only) | Splits the question into ≤3 English sub-queries, one per outlet, person or event. The original question is always searched too. If planning fails, the node falls back to the original question instead of failing the request. |
-| `retrieve` | – | Hybrid search for each query, then RRF across queries, at most 2 chunks per article, 8 excerpts. |
-| `generate` | 1 | Answers **only** from the numbered excerpts. Line 1 is the short answer; then an explanation with `[n]` citations, in the question's language. Says `Insufficient information.` when the excerpts do not contain the answer. |
-| `validate` | – | Deterministic check: there must be at least one citation, and every `[n]` must exist. Otherwise the answer becomes a refusal. This checks citation *integrity*, not *faithfulness*, which is measured offline. |
-| `refuse` | – | Safety guard for an empty database. |
-
-LLM calls per question are bounded: **1 for baseline, 2 for multihop**. The graph has
-no loops. Each node appends to `steps`, so every response carries its own execution
-trace.
-
-The graph receives its retriever, LLM and planner from outside (dependency
-injection). The same graph code runs in the API, in evaluation (real dependencies) and
-in tests (stubs: no database, no network).
-
-## 4. Retrieval design
-
-```mermaid
-flowchart LR
-    q["query"] --> emb["embed<br/>(Vertex AI)"]
-    emb --> vs["vector search<br/>pgvector cosine<br/>top 32"]
-    q --> terms["English terms"] --> fts["full-text search<br/>tsvector + GIN, OR-ed terms<br/>top 32"]
-    vs --> rrf["Reciprocal Rank Fusion<br/>score = Σ 1/(60 + rank)"]
-    fts --> rrf
-    rrf --> cap["≤ 2 chunks per article"] --> top["top 8"]
-```
-
-| Decision | Why |
-|---|---|
-| **Chunks of ~1,000 characters, 150 overlap, cut at sentence ends** | One vector per topic, not per 12,500-character article. The overlap keeps facts that straddle a boundary whole in at least one chunk. |
-| **`Source \| Date \| Title` header on every chunk** | Questions name outlets and dates ("according to TechCrunch..."), but article bodies rarely name their own outlet. Without the header, those words match nothing. |
-| **Hybrid: vector + keyword** | Embeddings match meaning ("automaker acquired" ↔ "car company bought"). Keywords match exact names ("TechCrunch", "Bankman-Fried"). |
-| **RRF instead of a weighted sum** | Cosine similarity and `ts_rank` are on unrelated scales. RRF uses only ranks: no weights to tune. |
-| **Fetch 4× candidates, keep 8** | A chunk ranked 12th by vector search and 2nd by keyword search must still reach the fusion step. |
-| **≤ 2 chunks per article** | Found through error analysis: one article filled 7 of 8 slots on a three-article question. With the cap, all evidence articles are found in **41% → 60%** of questions (main sample) and **35% → 49%** (held-out sample), with zero regressions. |
-| **Full-text `'english'` config, `websearch_to_tsquery` with OR** | Stemming ("running" → "run"). The parser is safe on arbitrary input. OR means a long question still matches. |
-| **Thai questions** | PostgreSQL has no Thai text-search config. The multilingual embedding handles meaning across languages; English names inside a Thai question still go through keyword search. |
-| **No vector index (exact scan)** | A few thousand chunks scan in milliseconds, with exact results. HNSW becomes worthwhile at around 10⁵–10⁶ chunks. |
-
-## 5. Data model
+## 3. Data model
 
 ```mermaid
 erDiagram
     documents ||--o{ chunks : "has (ON DELETE CASCADE)"
     documents {
         int id PK
-        text title "verbatim: evaluation matches on it"
+        text title
         text source "news outlet"
         text url UK "unique: re-ingestion replaces by URL"
-        text category
-        text author
         timestamptz published_at
     }
     chunks {
         int id PK
         int document_id FK
-        int chunk_index
-        text content "header + text: embedded, shown to the LLM, cited"
+        text content "header + text"
         vector embedding "VECTOR(768)"
-        text embedding_model "which model produced the vector"
-        jsonb metadata
+        text embedding_model
         tsvector search_vector "GENERATED from content, GIN index"
     }
 ```
 
-- `search_vector` is a **generated column**, so it can never drift out of sync with `content`.
-- `embedding_model` is stored on every chunk. Re-ingesting with a different model
-  replaces the old vectors instead of mixing them.
-- Schema changes go through Alembic. The first migration is hand-written: autogenerate
-  never emits `CREATE EXTENSION vector`.
+Vectors, full text and metadata live in one PostgreSQL database. `search_vector` is a
+generated column, so it can never drift out of sync with `content`. Schema changes go
+through Alembic.
 
-## 6. Code structure and patterns
-
-```text
-routers/   HTTP only: auth, validation, response mapping, logging
-graph/     orchestration: nodes, prompts, wiring. Never imports the database.
-services/  repository (all SQL) · retriever · embeddings/llm factories · chunker
-models/    SQLAlchemy tables · Pydantic schemas
-core/      settings
-```
-
-| Pattern | Where | Concrete benefit |
-|---|---|---|
-| **Repository** | `services/repository.py` | Every SQL statement is in one file. Callers never build queries, and storage could change without touching the graph. |
-| **Factory** | `services/embeddings.py`, `services/llm.py` | `EMBEDDING_PROVIDER=fake` runs the full test suite with no GCP account; `vertex` switches to real models. One line in `.env`. |
-| **Dependency injection** | `graph/workflow.py`, `services/rag.py` | One graph, three uses: API, evaluation (the exact production pipeline), and tests with stubs. |
-| **Protocol (structural typing)** | `EmbeddingProvider`, `Retriever`, `Planner` | Fakes and stubs fit without inheritance. |
-
-## 7. Production readiness
-
-### Availability
-
-| | Demo setup | How it holds up |
-|---|---|---|
-| Compute | Cloud Run, regional | Managed, restarts failed instances, spreads across zones |
-| Database | Cloud SQL, zonal | **Single point of failure in the demo.** Production: regional HA (standby in a second zone). |
-| Health checks | `/health` (liveness) and `/ready` (database reachable) | Liveness never touches the database, so a database outage doesn't trigger restart loops of healthy containers. |
-| Failure handling | Gemini calls have a 40 s timeout and no hidden retries. Planning failures fall back to the plain question. LLM or database errors become a clear `503`. | A slow or rate-limited model can't hang a request past Cloud Run's 120 s limit. |
-| Shutdown | The lifespan hook disposes the connection pool on SIGTERM | Connections are released immediately when Cloud Run stops an instance. |
-
-### Scalability: compute scales, the database is shared
-
-```text
-newsrag-api instance 1 ── pool 5 ──┐
-newsrag-api instance 2 ── pool 5 ──┼──► Cloud SQL (max_connections = 25)
-newsrag-api instance 3 ── pool 5 ──┘
-            max 3 × 5 = 15 connections; 10 spare for the ingest job and admin
-```
-
-- **Connections are sized explicitly.** SQLAlchemy's default pool (5 + 10 overflow)
-  multiplied by Cloud Run's default 100 instances would exceed the 25 connections of
-  the smallest Cloud SQL tier many times over.
-- **Connections are not held during LLM calls.** A request spends ~50 ms in the
-  database and 10–20 s waiting for Gemini. The retriever opens its own short session
-  per search and closes it before the LLM is called. One pooled connection therefore
-  serves many concurrent requests, and the bottleneck moves to Vertex AI quota, where
-  it belongs.
-
-| If this becomes the bottleneck | Fix |
-|---|---|
-| Database connections | Smaller pool or `--max-instances`; at larger scale, PgBouncer |
-| Vector search latency | HNSW index on `embedding` |
-| Database CPU | Larger tier, read replicas (retrieval is read-only) |
-| Repeated questions | Cache answers by (question, mode), e.g. in Memorystore |
-| Vertex AI rate limits (429) | Client-side retry with back-off, a quota increase, a concurrency cap |
-| Per-question latency (14–20 s p50) | Lower thinking level, streaming responses to the UI |
-
-### Cost
-
-| Item | Behaviour | Approximate cost (demo) |
-|---|---|---|
-| Cloud Run (API, UI, Job) | Billed only while handling requests (`min-instances=0`) | Mostly within the free tier |
-| Cloud SQL `db-f1-micro` | **Billed while running, even when idle** | ~$8–10 / month; stop it with `--activation-policy=NEVER` |
-| Vertex AI | Per token / per character | Expected to be a few dollars for one ingestion plus a 100-question evaluation; check the billing report for actuals |
-| Artifact Registry, Secret Manager | Storage and access | Cents |
-
-Cost controls: `--max-instances` caps spend; `/ask` requires an API key, and the UI
-requires a login, so a public URL cannot spend LLM quota; thinking level `low`; a budget
-alert on the billing account. Figures are estimates; check current GCP pricing.
-
-### Security
-
-- **No secrets in code, images or git.** Locally they live in `.env` (git-ignored and
-  excluded from images by `.dockerignore`). In production they come from Secret
-  Manager, injected at runtime.
-- **No LLM API key exists:** Vertex AI is authorised through the service account.
-- **Least-privilege service accounts**, granted only the specific secrets they need.
-- **Containers run as a non-root user.** The API image contains only runtime
-  dependencies.
-- **API key compared in constant time** (`secrets.compare_digest`). The UI has a
-  login, because it holds the API key.
-- **Question text is not logged**, since user input may contain personal data. Only
-  its length is logged.
-
-### Observability
-
-Each `/ask` writes one JSON line to stdout: request ID, mode, status, execution steps,
-number of excerpts and citations, model, latency. Cloud Logging turns it into a
-structured entry that can be filtered and charted by field, for example latency by
-mode or the rate of `validate:fail`.
-
-## 8. Demo vs production
-
-| | This deployment | Production |
-|---|---|---|
-| Cloud SQL | Zonal, `db-f1-micro`, no backups | Regional HA, larger tier, automated backups + point-in-time recovery |
-| Network | Public IP, no authorised networks, connector only | Private IP, VPC connector, Cloud Armor + HTTPS load balancer |
-| Auth | Shared API key; a demo login on the UI | Identity-Aware Proxy or OAuth per user; keys per client, rotated |
-| Vector search | Exact scan | HNSW index |
-| CI/CD | Manual `docker build` / `gcloud run deploy` | GitHub Actions with Workload Identity Federation (no JSON keys), deploying on merge |
-| Observability | Structured logs | Plus uptime checks, alerting on error rate and latency, tracing |
-| Data residency | Gemini via the `global` endpoint (newest models are served there first) | A regional endpoint if data must stay in one region |
-
-## 9. Key decisions and trade-offs
-
-| Decision | Alternative considered | Reason |
-|---|---|---|
-| **pgvector inside PostgreSQL** | Qdrant or another vector database | The test requires PostgreSQL, and at this scale one database gives vectors, full-text search and ACID with nothing extra to operate. Revisit at millions of chunks. |
-| **One API service** | Separate retrieval, embedding and generation services | No component has a different scaling profile yet. Splitting adds latency, auth and deployments without benefit. |
-| **UI as a separate service** | Serving the UI from the API | Different runtime (WebSockets, session affinity) and dependencies. The API stays usable through `/docs` if the UI fails. |
-| **LangGraph for orchestration, LangChain only as the model interface** | LangChain vector stores and retrievers | The graph makes control flow and the trace explicit. LangChain vector stores impose their own schema, which conflicts with Alembic and the generated full-text column. |
-| **Query decomposition (`plan`)** | Iterative, multi-round retrieval | Parallel sub-queries fit cross-outlet comparison questions with bounded cost (2 LLM calls). Iterative retrieval, where hop 2 depends on hop 1's answer, is the next step for true bridge questions. |
-| **Deterministic `validate`** | An LLM groundedness judge | Free, instant and reproducible. It checks citation integrity; faithfulness is measured offline in the evaluation. |
-| **Multilingual embedding model** | English-only embeddings | Thai questions retrieve English news. |
-| **Gemini thinking level `low`, 40 s timeout, no retries** | Model defaults | The defaults took ~40 s per answer and could hang for minutes on retries. Failing fast keeps requests within Cloud Run's timeout; the client decides whether to retry. |
-| **Per-article cap = 2** | No cap, or other values | Measured on two independent samples. Other values were not tuned on the test set, to avoid overfitting. |
-
-## 10. Deployment steps
+## 4. Deployment steps
 
 The commands used for this deployment, in order (bash syntax):
 
@@ -339,8 +158,10 @@ CONN=$(gcloud sql instances describe newsrag-db --format='value(connectionName)'
 # 4. Secrets (values written from files, never typed into commands)
 gcloud secrets create database-url --data-file=<file>   # postgresql+asyncpg://rag:…@/rag?host=/cloudsql/$CONN
 gcloud secrets create api-key --data-file=<file>
+gcloud secrets create demo-password --data-file=<file>
+gcloud secrets create chainlit-auth-secret --data-file=<file>   # from `chainlit create-secret`
 
-# 5. Service account with least privilege
+# 5. Service accounts with least privilege (API + job; the UI gets its own in step 8)
 gcloud iam service-accounts create newsrag-run
 SA=newsrag-run@$PROJECT.iam.gserviceaccount.com
 gcloud projects add-iam-policy-binding $PROJECT --member=serviceAccount:$SA --role=roles/aiplatform.user
@@ -362,8 +183,13 @@ gcloud run deploy newsrag-api --image=$REGISTRY/api:$TAG --region=$REGION --serv
   --set-env-vars=EMBEDDING_PROVIDER=vertex,LLM_PROVIDER=vertex,LLM_MODEL=gemini-3.8-flash,LLM_THINKING_LEVEL=low,GCP_PROJECT=$PROJECT,GCP_LOCATION=global,DEFAULT_MODE=multihop \
   --allow-unauthenticated --min-instances=0 --max-instances=3 --concurrency=20 --timeout=120 --memory=1Gi
 
-# 8. UI (its own service account: secrets only)
-gcloud run deploy newsrag-ui --image=$REGISTRY/ui:$TAG --region=$REGION --service-account=newsrag-ui@$PROJECT.iam.gserviceaccount.com \
+# 8. UI (its own service account: three secrets, no database or Vertex AI access)
+gcloud iam service-accounts create newsrag-ui
+UI_SA=newsrag-ui@$PROJECT.iam.gserviceaccount.com
+for SECRET in api-key demo-password chainlit-auth-secret; do
+  gcloud secrets add-iam-policy-binding $SECRET --member=serviceAccount:$UI_SA --role=roles/secretmanager.secretAccessor
+done
+gcloud run deploy newsrag-ui --image=$REGISTRY/ui:$TAG --region=$REGION --service-account=$UI_SA \
   --set-env-vars=API_URL=<API_URL> \
   --set-secrets=API_KEY=api-key:latest,DEMO_PASSWORD=demo-password:latest,CHAINLIT_AUTH_SECRET=chainlit-auth-secret:latest \
   --allow-unauthenticated --session-affinity --min-instances=0 --max-instances=1 --timeout=3600 --memory=512Mi

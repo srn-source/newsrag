@@ -89,7 +89,7 @@ class HybridRetriever:
     ) -> None:
         # A session FACTORY, not a session: retrieve() opens its own short session and
         # closes it before returning, so no database connection is held while the
-        # graph waits 2-5 s for the LLM. (See DESIGN.md §2.4.)
+        # graph waits for the LLM.
         self.session_factory = session_factory
         self.embedder = embedder
         # Each search returns top_k x 4 candidates; fusion then keeps the best top_k.

@@ -50,6 +50,7 @@ from eval.metrics import (
     is_correct,
     paired_bootstrap_diff,
     retrieval_scores,
+    token_f1,
     unique_urls,
     wilson_interval,
 )
@@ -321,6 +322,9 @@ async def evaluate_generation(questions: list[dict], graph, chat_model, modes, o
                 "answer": state["answer"],
                 "correct": error is None
                 and is_correct(state["answer"], question["answer"], question["type"]),
+                "token_f1": 0.0
+                if error
+                else token_f1(state["answer"], question["answer"], question["type"]),
                 # validate replaced this answer with a refusal: was the original right?
                 "draft": draft,
                 "draft_correct": draft is not None
@@ -359,7 +363,8 @@ def generation_table(records: list[dict], modes: list[str]) -> str:
     headers = [
         "mode",
         *[f"{SHORT[qtype]} (n={counts[qtype]})" for qtype in TYPES if counts[qtype]],
-        "overall",
+        "overall EM",
+        "overall token F1",
         "evidence recall",
         "latency p50 (ms)",
         "LLM calls",
@@ -380,7 +385,10 @@ def generation_table(records: list[dict], modes: list[str]) -> str:
                     if counts[qtype]
                 ],
                 proportion_cell([record["correct"] for record in group]),
-                fmt(mean(record["evidence_recall"] for record in group)),
+                mean_cell([record["token_f1"] for record in group]),
+                mean_cell(
+                    [r["evidence_recall"] for r in group if r["evidence_recall"] is not None]
+                ),
                 str(round(statistics.median(latencies))) if latencies else "-",
                 fmt(mean(record["llm_calls"] for record in group), 1),
                 f"{len(rejected)} ({sum(r['draft_correct'] for r in rejected)})",
@@ -396,7 +404,37 @@ def generation_differences(records: list[dict], modes: list[str]) -> str:
         records,
         group_field="mode",
         comparisons=[(a, b) for a, b in wanted if a in modes and b in modes],
-        metrics=[("accuracy", "correct")],
+        metrics=[("accuracy (EM)", "correct"), ("token F1", "token_f1")],
+    )
+
+
+def answering_table(records: list[dict], modes: list[str]) -> str:
+    """Accuracy split into how often each mode answers and how often it is right when it does.
+
+    A system can raise accuracy by answering more (risking made-up answers) or by
+    answering better. These columns separate the two:
+      coverage    answerable questions it answered instead of refusing
+      precision   answers given (to any question) that were correct
+      null refused unanswerable questions it correctly refused
+    """
+    rows = []
+    for mode in modes:
+        group = [record for record in records if record["mode"] == mode]
+        answerable = [r for r in group if r["type"] != "null_query"]
+        null = [r for r in group if r["type"] == "null_query"]
+        answered = [r for r in group if r["answer"] and not is_refusal(r["answer"])]
+        rows.append(
+            [
+                mode,
+                f"{len(answered)} of {len(group)}",
+                proportion_cell([bool(r["answer"]) and not is_refusal(r["answer"]) for r in answerable]),
+                proportion_cell([r["correct"] for r in answered]),
+                proportion_cell([is_refusal(r["answer"]) for r in null]),
+            ]
+        )
+    return markdown_table(
+        ["mode", "answered", "coverage (answerable)", "precision (when answering)", "null refused"],
+        rows,
     )
 
 
@@ -452,8 +490,13 @@ HOW_TO_READ = f"""## How to read these numbers
 
 - `0.80 [0.71, 0.87]` = the measured score and its 95% confidence interval: with a
   different sample of questions, the score would most likely land in that range.
-  Accuracy and AllHit use the Wilson interval; Recall and MRR use a bootstrap
-  ({BOOTSTRAP_ITERATIONS:,} resamples).
+  Proportions (AllHit, EM, precision, coverage, null refused) use the Wilson
+  interval; means (Recall, MRR, token F1, evidence recall) use a bootstrap
+  ({BOOTSTRAP_ITERATIONS:,} resamples). Latency is a cost, reported without one.
+- Answers: EM (exact match) = line 1 matches the gold answer, 1 or 0. Token F1 =
+  word overlap with the gold answer (SQuAD-style), giving partial credit, e.g.
+  "Everton" vs "Everton Football Club" = 0.50. Yes/No and null questions score
+  the same under both.
 - Each per-type column shows its own n. With ~25 questions per type the intervals
   are wide: read them as trends. The overall column is the headline number.
 - Differences are paired (same questions for both sides). If the interval contains
@@ -485,10 +528,19 @@ def report_sections(retrieval: list[dict], generation: list[dict]) -> list[tuple
         sections.append(("Retrieval (answerable questions only)", retrieval_table(retrieval)))
         sections.append(("Retrieval: paired differences", retrieval_differences(retrieval)))
     if generation:
+        # Results saved before token F1 existed: score them now (no API calls needed).
+        for record in generation:
+            if "token_f1" not in record:
+                record["token_f1"] = (
+                    0.0
+                    if record["error"]
+                    else token_f1(record["answer"], record["gold"], record["type"])
+                )
         modes = [mode for mode in MODES if any(r["mode"] == mode for r in generation)]
         sections.append(("Answers (accuracy of line 1)", generation_table(generation, modes)))
         if len(modes) > 1:
             sections.append(("Answers: paired differences", generation_differences(generation, modes)))
+        sections.append(("Answers: answering vs refusing", answering_table(generation, modes)))
         sections.append(("Answers: error analysis", error_analysis_table(generation, modes)))
     return sections
 

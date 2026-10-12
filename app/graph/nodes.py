@@ -141,7 +141,7 @@ def grade(state: RAGState) -> str:
     so `chunks` is empty only if nothing was ingested. Deciding whether the excerpts
     actually answer the question is left to the LLM (it can answer NOT_FOUND) and
     to `validate`. A score threshold here would be meaningless: RRF scores of the
-    top hit are always >= 1/61. (DESIGN.md §2.2)
+    top hit are always >= 1/61.
     """
     return "generate" if state["chunks"] else "refuse"
 

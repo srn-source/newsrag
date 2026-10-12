@@ -80,7 +80,7 @@ def upgrade() -> None:
     op.create_index("ix_chunks_document_id", "chunks", ["document_id"])
 
     # No vector index (HNSW/IVFFlat) on purpose: at ~9,000 chunks an exact scan is
-    # fast and exact. Add one when the corpus grows — see docs/adr/001.
+    # fast and exact. Add one (HNSW) when the corpus grows.
 
 
 def downgrade() -> None:

@@ -12,6 +12,7 @@ from eval.metrics import (
     normalize,
     paired_bootstrap_diff,
     retrieval_scores,
+    token_f1,
     unique_urls,
     wilson_interval,
 )
@@ -55,6 +56,31 @@ def test_a_refusal_is_wrong_for_an_answerable_question() -> None:
 def test_null_questions_are_correct_only_when_refused() -> None:
     assert is_correct(f"{NOT_FOUND}\nNothing in the excerpts.", NOT_FOUND, "null_query") is True
     assert is_correct("Sam Bankman-Fried\n[1]", NOT_FOUND, "null_query") is False
+
+
+@pytest.mark.parametrize(
+    ("answer", "gold", "expected"),
+    [
+        ("Google\n[1]", "Google", 1.0),
+        ("Everton\n[1]", "Everton Football Club", 0.5),  # P 1/1, R 1/3 -> 0.50
+        ("Bankman-Fried\n[1]", "Sam Bankman-Fried", 0.8),  # P 2/2, R 2/3 -> 0.80
+        ("The Verge\n[1]", "Verge", 1.0),  # articles are ignored, as in SQuAD
+        ("Caroline Ellison\n[1]", "Sam Bankman-Fried", 0.0),
+    ],
+)
+def test_token_f1_gives_partial_credit_on_names(answer: str, gold: str, expected: float) -> None:
+    assert token_f1(answer, gold, "inference_query") == pytest.approx(expected)
+
+
+def test_token_f1_is_all_or_nothing_for_yes_no() -> None:
+    assert token_f1("Yes, both outlets agree [1]", "Yes", "comparison_query") == 1.0
+    assert token_f1("No\n[1]", "Yes", "comparison_query") == 0.0
+
+
+def test_token_f1_for_refusals() -> None:
+    assert token_f1(NOT_FOUND, NOT_FOUND, "null_query") == 1.0
+    assert token_f1("Google\n[1]", NOT_FOUND, "null_query") == 0.0
+    assert token_f1(NOT_FOUND, "Google", "inference_query") == 0.0
 
 
 def chunk(url: str) -> RetrievedChunk:

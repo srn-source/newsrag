@@ -9,6 +9,7 @@ the same verdict every run.
 import math
 import random
 import re
+from collections import Counter
 from collections.abc import Sequence
 
 from app.graph.nodes import first_line, is_refusal
@@ -47,6 +48,44 @@ def is_correct(answer: str, gold: str, question_type: str) -> bool:
     if expected in {"yes", "no"}:
         return predicted.split()[:1] == [expected]
     return f" {expected} " in f" {predicted} "
+
+
+_ARTICLES = {"a", "an", "the"}
+
+
+def token_f1(answer: str, gold: str, question_type: str) -> float:
+    """SQuAD-style token F1 between line 1 of the answer and the gold answer (0-1).
+
+    Gives partial credit where exact match gives none:
+        gold "Everton Football Club", answer "Everton"  -> EM 0, F1 0.50
+        gold "Sam Bankman-Fried",     answer "Bankman-Fried" -> EM 0, F1 0.80
+    precision = shared words / words in the answer
+    recall    = shared words / words in the gold answer
+    F1        = 2 * precision * recall / (precision + recall)
+
+    Yes/No and null questions have no partial answers, so they score exactly like
+    is_correct (1 or 0). Normalisation follows SQuAD: lower case, no punctuation,
+    no articles.
+    """
+    refused = is_refusal(answer)
+    if question_type == "null_query":
+        return 1.0 if refused else 0.0
+    if refused:
+        return 0.0
+
+    expected = [word for word in normalize(gold).split() if word not in _ARTICLES]
+    if expected in (["yes"], ["no"]):
+        return 1.0 if is_correct(answer, gold, question_type) else 0.0
+
+    predicted = [word for word in normalize(first_line(answer)).split() if word not in _ARTICLES]
+    if not predicted or not expected:
+        return 0.0
+    shared = sum((Counter(predicted) & Counter(expected)).values())
+    if shared == 0:
+        return 0.0
+    precision = shared / len(predicted)
+    recall = shared / len(expected)
+    return 2 * precision * recall / (precision + recall)
 
 
 def unique_urls(chunks: list[RetrievedChunk]) -> list[str]:

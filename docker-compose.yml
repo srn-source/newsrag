@@ -4,7 +4,8 @@
 #   docker compose logs -f db    # watch startup
 #   docker compose down          # stop, keep data
 #   docker compose down -v       # stop and DELETE the data volume
-#   docker compose up --build    # db + api; then open http://localhost:8080/docs
+#   docker compose up --build    # db + api + ui: http://localhost:8080/docs and http://localhost:8000
+#   docker compose --profile jobs run --rm ingest  # migrate + ingest the corpus (once)
 #
 #   docker compose --profile tools up -d adminer   # database web UI: http://localhost:8081
 #     login -> System: PostgreSQL | Server: db | Username: rag | Password: rag | Database: rag
@@ -54,6 +55,26 @@ services:
     depends_on:
       db:
         condition: service_healthy # wait for pg_isready, not just "container started"
+
+  ui:
+    # The Chainlit chat UI: the same image as the Cloud Run service newsrag-ui.
+    build:
+      context: . # the Dockerfile needs pyproject.toml + uv.lock from the root
+      dockerfile: frontend/Dockerfile
+    image: newsrag-ui
+    container_name: newsrag-ui
+    environment:
+      # Inside the compose network the API is reached by its service name.
+      API_URL: http://api:8080
+      # ${VAR:-} reads the value from .env (empty if not set). Empty DEMO_PASSWORD
+      # = no login page.
+      API_KEY: ${API_KEY:-}
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-}
+      CHAINLIT_AUTH_SECRET: ${CHAINLIT_AUTH_SECRET:-}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - api
 
   ingest:
     # The same image the Cloud Run Job runs: `alembic upgrade head`, then ingestion.
