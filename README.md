@@ -11,7 +11,6 @@ deployed on Google Cloud Run with Cloud SQL.
 |---|---|
 | **Chat UI (live)** | https://newsrag-ui-cgblbum2pa-as.a.run.app — login details are sent separately |
 | **API docs (live)** | https://newsrag-api-cgblbum2pa-as.a.run.app/docs — `POST /ask` needs the `X-API-Key` header, sent separately |
-| **Demo video** | `<VIDEO_URL>` |
 | **Architecture** | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | **Evaluation** | [EVALUATION.md](EVALUATION.md) |
 
@@ -119,7 +118,7 @@ Start with the same two steps, then choose **Option A (Python)** or **Option B (
 only)**.
 
 ```bash
-git clone <GITHUB_REPO_URL> && cd <repo>
+git clone https://github.com/srn-source/newsrag.git && cd newsrag
 cp .env.example .env                  # fake providers: no GCP account needed
 ```
 
